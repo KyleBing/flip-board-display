@@ -11,6 +11,13 @@ const FONT_OPTIONS = [
 ];
 const WS_SOURCE_OPTIONS = [{ label: "OKX", value: "okx" }];
 
+function makeId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 const state = {
   title: "出发航班", // 看板标题文本。
   fontFamily: FONT_STACK, // 翻牌字符使用的主字体栈。
@@ -31,18 +38,18 @@ const state = {
   wsSymbols: "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,ADA-USDT,XRP-USDT,DOGE-USDT,TRX-USDT,LTC-USDT,LINK-USDT", // 订阅交易对列表。
   wsStatus: "未连接", // 连接状态展示。
   columns: [
-    { id: crypto.randomUUID(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
-    { id: crypto.randomUUID(), label: "目的地", key: "destination", type: "text", length: 14, align: "left" },
-    { id: crypto.randomUUID(), label: "航班", key: "flight", type: "text", length: 6, align: "left" },
-    { id: crypto.randomUUID(), label: "登机口", key: "gate", type: "text", length: 2, align: "right" },
-    { id: crypto.randomUUID(), label: "状态", key: "active", type: "status" },
+    { id: makeId(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
+    { id: makeId(), label: "目的地", key: "destination", type: "text", length: 14, align: "left" },
+    { id: makeId(), label: "航班", key: "flight", type: "text", length: 6, align: "left" },
+    { id: makeId(), label: "登机口", key: "gate", type: "text", length: 2, align: "right" },
+    { id: makeId(), label: "状态", key: "active", type: "status" },
   ],
   rows: [
-    { id: crypto.randomUUID(), time: "18:35", destination: "Jakarta", flight: "SQ0166", gate: "07", active: true },
-    { id: crypto.randomUUID(), time: "18:45", destination: "Penang", flight: "SQ0198", gate: "07", active: true },
-    { id: crypto.randomUUID(), time: "18:50", destination: "Dhaka", flight: "SQ0436", gate: "11", active: false },
-    { id: crypto.randomUUID(), time: "18:55", destination: "Kuala Lumpur", flight: "MH6176", gate: "14", active: true },
-    { id: crypto.randomUUID(), time: "19:00", destination: "Hong Kong", flight: "SQ0868", gate: "18", active: false },
+    { id: makeId(), time: "18:35", destination: "Jakarta", flight: "SQ0166", gate: "07", active: true },
+    { id: makeId(), time: "18:45", destination: "Penang", flight: "SQ0198", gate: "07", active: true },
+    { id: makeId(), time: "18:50", destination: "Dhaka", flight: "SQ0436", gate: "11", active: false },
+    { id: makeId(), time: "18:55", destination: "Kuala Lumpur", flight: "MH6176", gate: "14", active: true },
+    { id: makeId(), time: "19:00", destination: "Hong Kong", flight: "SQ0868", gate: "18", active: false },
   ],
 };
 
@@ -223,7 +230,7 @@ function queueTileRoll(tile, fromChar, toChar, startAt = performance.now()) {
 
 function makeTextColumn() {
   return {
-    id: crypto.randomUUID(),
+    id: makeId(),
     label: "列",
     key: `field${state.columns.length + 1}`,
     type: "text",
@@ -234,7 +241,7 @@ function makeTextColumn() {
 
 function makeStatusColumn() {
   return {
-    id: crypto.randomUUID(),
+    id: makeId(),
     label: "状态",
     key: `status${state.columns.length + 1}`,
     type: "status",
@@ -242,7 +249,7 @@ function makeStatusColumn() {
 }
 
 function makeEmptyRow() {
-  const row = { id: crypto.randomUUID() };
+  const row = { id: makeId() };
   state.columns.forEach((column) => {
     row[column.key] = column.type === "status" ? true : "";
   });
@@ -318,10 +325,10 @@ function randomizeRows() {
 
 function getWsColumnPreset() {
   return [
-    { id: crypto.randomUUID(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
-    { id: crypto.randomUUID(), label: "交易对", key: "pair", type: "text", length: 10, align: "left" },
-    { id: crypto.randomUUID(), label: "最新价", key: "last", type: "text", length: 9, align: "right" },
-    { id: crypto.randomUUID(), label: "状态", key: "active", type: "status" },
+    { id: makeId(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
+    { id: makeId(), label: "交易对", key: "pair", type: "text", length: 10, align: "left" },
+    { id: makeId(), label: "最新价", key: "last", type: "text", length: 9, align: "right" },
+    { id: makeId(), label: "状态", key: "active", type: "status" },
   ];
 }
 
@@ -532,7 +539,7 @@ function applyBulkData() {
 
   const parsedRows = dataLines.map((line) => {
     const parts = line.split("|");
-    const nextRow = { id: crypto.randomUUID() };
+    const nextRow = { id: makeId() };
 
     state.columns.forEach((column, index) => {
       const value = parts[index] ?? "";
