@@ -1,5 +1,6 @@
 // @ts-nocheck // 临时关闭 TS 类型检查
 import "./styles.scss";
+import { createOkxWsClient } from "./ws";
 
 const CHARSET = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:/-*#";
 const FONT_STACK = '"JetBrains Mono Local", monospace';
@@ -8,6 +9,7 @@ const FONT_OPTIONS = [
   { label: "JetBrains Mono（本地）", value: '"JetBrains Mono Local", monospace' },
   { label: "Roboto Mono（本地）", value: '"Roboto Mono Local", monospace' },
 ];
+const WS_SOURCE_OPTIONS = [{ label: "OKX", value: "okx" }];
 
 const state = {
   title: "出发航班", // 看板标题文本。
@@ -16,7 +18,7 @@ const state = {
   charHeight: 62, // 单个字符格高度。
   fontScale: 0.85, // 字符在格子中的占比（0.6~1.0）。
   midlineGap: 2, // 中间黑线间隔（像素）。
-  tileGap: 2, // 字符格之间的水平间距。
+  tileGap: 0, // 字符格之间的水平间距。
   tileRadius: 0, // 上下翻页卡片的圆角半径。
   rowGap: 16, // 行与行之间的垂直间距。
   columnGap: 22, // 信息列之间的水平间距。
@@ -24,6 +26,10 @@ const state = {
   labelHeight: 26, // 列标题区域高度。
   titleHeight: 34, // 看板标题区域高度。
   flipDuration: 260, // 基础翻页时长（毫秒）。
+  wsEnabled: false, // 是否启用 WebSocket 实时数据。
+  wsSource: "okx", // WebSocket 数据源。
+  wsSymbols: "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,ADA-USDT,XRP-USDT,DOGE-USDT,TRX-USDT,LTC-USDT,LINK-USDT", // 订阅交易对列表。
+  wsStatus: "未连接", // 连接状态展示。
   columns: [
     { id: crypto.randomUUID(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
     { id: crypto.randomUUID(), label: "目的地", key: "destination", type: "text", length: 14, align: "left" },
@@ -102,6 +108,11 @@ const ctx = canvas.getContext("2d");
 
 const tileState = new Map();
 const resizeObserver = new ResizeObserver(() => renderer.render(performance.now()));
+const wsDecimalCache = new Map();
+const wsUpdateCounter = new Map();
+const wsActivityScore = new Map();
+const wsLastPriceMap = new Map();
+const WS_MAX_ROWS = 10;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -181,11 +192,11 @@ function buildRollSequence(fromChar, toChar) {
 
 function getRollStepDuration(stepCount) {
   if (stepCount <= 1) {
-    return Math.max(70, Math.round(state.flipDuration * 0.8));
+    return Math.max(110, Math.round(state.flipDuration * 0.95));
   }
 
-  // 连续字母切换时使用更快的下翻节奏。
-  return clamp(Math.round(state.flipDuration / Math.min(stepCount + 1, 8)), 40, Math.max(120, state.flipDuration));
+  // 连续字符切换时仍保持可感知的翻页节奏，避免“秒切”。
+  return clamp(Math.round(state.flipDuration / Math.min(stepCount * 0.8 + 0.8, 5)), 90, Math.max(180, state.flipDuration));
 }
 
 function getReplayStartChar(targetChar) {
@@ -305,6 +316,171 @@ function randomizeRows() {
   });
 }
 
+function getWsColumnPreset() {
+  return [
+    { id: crypto.randomUUID(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
+    { id: crypto.randomUUID(), label: "交易对", key: "pair", type: "text", length: 10, align: "left" },
+    { id: crypto.randomUUID(), label: "最新价", key: "last", type: "text", length: 9, align: "right" },
+    { id: crypto.randomUUID(), label: "状态", key: "active", type: "status" },
+  ];
+}
+
+function hasWsColumnPreset() {
+  const targetKeys = ["time", "pair", "last", "active"];
+  return state.columns.length === targetKeys.length && targetKeys.every((key, index) => state.columns[index]?.key === key);
+}
+
+function applyWsColumnPreset() {
+  if (hasWsColumnPreset()) {
+    return;
+  }
+
+  state.columns = getWsColumnPreset();
+  syncRowsToColumns();
+  renderControls();
+  renderer.syncTargets();
+  renderer.render(performance.now());
+}
+
+function setWsStatus(text) {
+  state.wsStatus = text;
+  const statusEl = document.querySelector("#wsStatusText");
+  if (statusEl) {
+    if ("value" in statusEl) {
+      statusEl.value = text;
+    } else {
+      statusEl.textContent = text;
+    }
+  }
+}
+
+function refreshBoardOnly() {
+  syncRowsToColumns();
+  renderer.syncTargets();
+  renderer.render(performance.now());
+}
+
+function getOrCreateWsRow(symbol) {
+  const pairText = String(symbol ?? "");
+  let row = state.rows.find((item) => String(item.pair ?? "") === pairText);
+  if (!row) {
+    if (state.rows.length >= WS_MAX_ROWS) {
+      return null;
+    }
+    row = makeEmptyRow();
+    row.pair = pairText;
+    state.rows.push(row);
+  }
+  return row;
+}
+
+function sortWsRowsByActivity() {
+  state.rows.sort((a, b) => {
+    const pairA = String(a.pair ?? "");
+    const pairB = String(b.pair ?? "");
+    const scoreA = wsActivityScore.get(pairA) ?? 0;
+    const scoreB = wsActivityScore.get(pairB) ?? 0;
+    if (scoreA !== scoreB) {
+      return scoreB - scoreA;
+    }
+    const countA = wsUpdateCounter.get(pairA) ?? 0;
+    const countB = wsUpdateCounter.get(pairB) ?? 0;
+    if (countA !== countB) {
+      return countB - countA;
+    }
+    return pairA.localeCompare(pairB);
+  });
+}
+
+function applyTickerUpdate(ticker) {
+  const symbol = ticker.symbol;
+  if (!symbol) {
+    return;
+  }
+
+  const activity = Number(ticker.volCcy24h || ticker.vol24h || 0);
+  const row = getOrCreateWsRow(symbol);
+  if (!row) {
+    return;
+  }
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mm = String(now.getMinutes()).padStart(2, "0");
+  const pairText = symbol;
+  let lastValue = ticker.last ?? "";
+  const previousRowActive = row.active;
+  let isActive = typeof previousRowActive === "boolean" ? previousRowActive : Number(ticker.last || 0) >= Number(ticker.open24h || 0);
+  const currentLastPrice = Number(ticker.last);
+
+  const defaultDecimals = 4;
+  const resolveDecimals = (textValue) => {
+    const cacheKey = `${symbol}:decimals`;
+    if (wsDecimalCache.has(cacheKey)) {
+      return wsDecimalCache.get(cacheKey);
+    }
+    const parts = String(textValue ?? "").split(".");
+    const decimals = parts[1] ? clamp(parts[1].length, 2, 8) : defaultDecimals;
+    wsDecimalCache.set(cacheKey, decimals);
+    return decimals;
+  };
+  const formatStableNumber = (textValue, decimals) => {
+    const numeric = Number(textValue);
+    if (!Number.isFinite(numeric)) {
+      return String(textValue ?? "");
+    }
+    return numeric.toFixed(decimals);
+  };
+  const priceDecimals = resolveDecimals(lastValue);
+  lastValue = formatStableNumber(lastValue, priceDecimals);
+  const previousLastPrice = wsLastPriceMap.get(pairText);
+  if (Number.isFinite(currentLastPrice) && Number.isFinite(previousLastPrice)) {
+    if (currentLastPrice > previousLastPrice) {
+      isActive = true; // 上涨：绿色
+    } else if (currentLastPrice < previousLastPrice) {
+      isActive = false; // 下跌：红色
+    } else {
+      // 价格持平时保持上一跳状态，避免红绿闪回。
+      isActive = typeof previousRowActive === "boolean" ? previousRowActive : isActive;
+    }
+  }
+  if (Number.isFinite(currentLastPrice)) {
+    wsLastPriceMap.set(pairText, currentLastPrice);
+  }
+
+  row.time = `${hh}:${mm}`;
+  row.pair = pairText;
+  row.last = String(lastValue);
+  row.active = Boolean(isActive);
+  wsActivityScore.set(pairText, Number.isFinite(activity) ? activity : 0);
+  wsUpdateCounter.set(pairText, (wsUpdateCounter.get(pairText) ?? 0) + 1);
+  sortWsRowsByActivity();
+
+  refreshBoardOnly();
+}
+
+const wsClient = createOkxWsClient({
+  onStatus: setWsStatus,
+  onTicker: applyTickerUpdate,
+});
+
+function connectMarketSocket() {
+  if (!state.wsEnabled) {
+    return;
+  }
+  applyWsColumnPreset();
+  state.wsSource = "okx";
+  wsUpdateCounter.clear();
+  wsActivityScore.clear();
+  wsLastPriceMap.clear();
+  state.rows = [];
+  refreshBoardOnly();
+  wsClient.connect(state.wsSymbols);
+}
+
+function stopMarketSocket() {
+  wsClient.disconnect();
+}
+
 function serializeRowsForEditor() {
   const keys = state.columns.map((column) => column.key);
   const header = keys.join("|");
@@ -394,6 +570,28 @@ function renderControls() {
                 `<option value="${escapeHtml(option.value)}" ${state.fontFamily === option.value ? "selected" : ""}>${escapeHtml(option.label)}</option>`,
             ).join("")}
           </select>
+        </label>
+      </div>
+    </section>
+
+    <section class="setup-group">
+      <h3>实时数据</h3>
+      <div class="form-grid">
+        <label class="field field--toggle">
+          <span>启用WS</span>
+          <input data-number="wsEnabled" type="checkbox" ${state.wsEnabled ? "checked" : ""} />
+        </label>
+        <label class="field">
+          <span>数据源</span>
+          <input type="text" readonly value="${WS_SOURCE_OPTIONS[0].label}" />
+        </label>
+        <label class="field" style="grid-column: 1 / -1;">
+          <span>交易对（逗号分隔）</span>
+          <input data-path="wsSymbols" type="text" value="${escapeHtml(state.wsSymbols)}" />
+        </label>
+        <label class="field" style="grid-column: 1 / -1;">
+          <span>状态</span>
+          <input id="wsStatusText" type="text" readonly value="${escapeHtml(state.wsStatus)}" />
         </label>
       </div>
     </section>
@@ -522,11 +720,19 @@ function renderControls() {
   });
 
   controlsEl.querySelectorAll("[data-number]").forEach((input) => {
-    input.addEventListener("input", (event) => {
+    const eventName = input.type === "checkbox" ? "change" : "input";
+    input.addEventListener(eventName, (event) => {
       const { number } = event.currentTarget.dataset;
-      state[number] = Number(event.currentTarget.value);
+      state[number] = event.currentTarget.type === "checkbox" ? event.currentTarget.checked : Number(event.currentTarget.value);
       renderer.syncTargets();
       renderer.render(performance.now());
+      if (number === "wsEnabled") {
+        if (state.wsEnabled) {
+          connectMarketSocket();
+        } else {
+          stopMarketSocket();
+        }
+      }
     });
   });
 
@@ -558,6 +764,15 @@ function renderControls() {
           });
         }
       });
+    });
+  });
+
+  controlsEl.querySelectorAll('[data-path="wsSymbols"]').forEach((input) => {
+    const eventName = input.tagName === "SELECT" ? "change" : "blur";
+    input.addEventListener(eventName, () => {
+      if (state.wsEnabled) {
+        connectMarketSocket();
+      }
     });
   });
 
@@ -654,6 +869,11 @@ function getCanvasColumnLabel(column) {
     destination: "DESTINATION",
     flight: "FLIGHT",
     gate: "GATE",
+    pair: "PAIR",
+    last: "LAST",
+    bid: "BID",
+    ask: "ASK",
+    chg: "24H%",
     active: "STATUS",
   };
 
@@ -666,7 +886,58 @@ class FlipBoardRenderer {
     this.canvas = targetCanvas;
     this.viewport = viewport;
     this.devicePixelRatio = window.devicePixelRatio || 1;
+    this.canvasPixelWidth = 0;
+    this.canvasPixelHeight = 0;
+    this.canvasCssWidth = 0;
+    this.canvasCssHeight = 0;
+    this.cachedViewportWidth = 0;
+    this.cachedViewportHeight = 0;
+    this.cachedLayout = null;
     this.syncTargets();
+  }
+
+  invalidateLayout() {
+    this.cachedLayout = null;
+  }
+
+  resizeCanvas(cssWidth, cssHeight) {
+    const dpr = window.devicePixelRatio || 1;
+    if (dpr !== this.devicePixelRatio) {
+      this.devicePixelRatio = dpr;
+      this.cachedLayout = null;
+    }
+    const pixelWidth = Math.floor(cssWidth * this.devicePixelRatio);
+    const pixelHeight = Math.floor(cssHeight * this.devicePixelRatio);
+    const sizeChanged =
+      pixelWidth !== this.canvasPixelWidth ||
+      pixelHeight !== this.canvasPixelHeight ||
+      cssWidth !== this.canvasCssWidth ||
+      cssHeight !== this.canvasCssHeight;
+    if (!sizeChanged) {
+      return;
+    }
+
+    this.canvasPixelWidth = pixelWidth;
+    this.canvasPixelHeight = pixelHeight;
+    this.canvasCssWidth = cssWidth;
+    this.canvasCssHeight = cssHeight;
+    this.canvas.width = pixelWidth;
+    this.canvas.height = pixelHeight;
+    this.canvas.style.width = `${cssWidth}px`;
+    this.canvas.style.height = `${cssHeight}px`;
+  }
+
+  getCachedLayout(viewportWidth, viewportHeight) {
+    if (
+      !this.cachedLayout ||
+      this.cachedViewportWidth !== viewportWidth ||
+      this.cachedViewportHeight !== viewportHeight
+    ) {
+      this.cachedViewportWidth = viewportWidth;
+      this.cachedViewportHeight = viewportHeight;
+      this.cachedLayout = this.getLayout();
+    }
+    return this.cachedLayout;
   }
 
   getLayout() {
@@ -714,6 +985,7 @@ class FlipBoardRenderer {
   }
 
   syncTargets() {
+    this.invalidateLayout();
     const activeKeys = new Set();
 
     state.rows.forEach((row) => {
@@ -779,17 +1051,14 @@ class FlipBoardRenderer {
   }
 
   render(now) {
-    const { columns, rowHeight, contentRight } = this.getLayout();
     const isFullscreen = document.fullscreenElement === this.canvas;
     const viewportWidth = isFullscreen ? window.innerWidth : this.viewport.clientWidth;
     const viewportHeight = isFullscreen ? window.innerHeight : this.viewport.clientHeight;
     const canvasWidth = Math.max(320, Math.floor(viewportWidth));
     const canvasHeight = Math.max(240, Math.floor(viewportHeight));
+    const { columns, rowHeight, contentRight } = this.getCachedLayout(canvasWidth, canvasHeight);
 
-    this.canvas.width = Math.floor(canvasWidth * this.devicePixelRatio);
-    this.canvas.height = Math.floor(canvasHeight * this.devicePixelRatio);
-    this.canvas.style.width = `${canvasWidth}px`;
-    this.canvas.style.height = `${canvasHeight}px`;
+    this.resizeCanvas(canvasWidth, canvasHeight);
 
     this.ctx.setTransform(this.devicePixelRatio, 0, 0, this.devicePixelRatio, 0, 0);
     this.ctx.clearRect(0, 0, canvasWidth, canvasHeight);
@@ -825,7 +1094,7 @@ class FlipBoardRenderer {
 
     let x = state.boardPadding;
     const labelY = state.boardPadding + state.titleHeight + state.labelHeight / 2;
-    this.ctx.font = `600 11px Inter, system-ui, sans-serif`;
+    this.ctx.font = `700 14px Inter, system-ui, sans-serif`;
 
     columns.forEach((column) => {
       this.ctx.fillStyle = "rgba(216, 216, 216, 0.88)";
@@ -838,9 +1107,11 @@ class FlipBoardRenderer {
     const top = state.boardPadding + state.titleHeight + state.labelHeight;
     const bottomLimit = canvasHeight - state.boardPadding;
     const rightLimit = canvasWidth - state.boardPadding;
+    const rowStride = rowHeight + state.rowGap;
+    const rowsPerPage = Math.max(1, Math.floor((bottomLimit - top + state.rowGap) / rowStride));
 
-    for (let rowIndex = 0; ; rowIndex += 1) {
-      const y = top + rowIndex * (rowHeight + state.rowGap);
+    for (let rowIndex = 0; rowIndex < rowsPerPage; rowIndex += 1) {
+      const y = top + rowIndex * rowStride;
       if (y + rowHeight > bottomLimit) {
         break;
       }
@@ -968,17 +1239,17 @@ class FlipBoardRenderer {
       progress = tile.startedAt > 0 ? clamp((now - tile.startedAt) / tile.duration, 0, 1) : 1;
     }
 
-    this.ctx.fillStyle = "rgba(0,0,0,0.22)";
+    this.ctx.fillStyle = "rgba(0,0,0,0.42)";
     this.ctx.fillRect(x, y, width, height);
 
     const backgroundTop = this.ctx.createLinearGradient(topRect.x, topRect.y, topRect.x, topRect.y + topRect.height);
-    backgroundTop.addColorStop(0, "#4b4b4b");
-    backgroundTop.addColorStop(0.55, "#393939");
-    backgroundTop.addColorStop(1, "#2a2a2a");
+    backgroundTop.addColorStop(0, "#343434");
+    backgroundTop.addColorStop(0.55, "#282828");
+    backgroundTop.addColorStop(1, "#1d1d1d");
     const backgroundBottom = this.ctx.createLinearGradient(bottomRect.x, bottomRect.y, bottomRect.x, bottomRect.y + bottomRect.height);
-    backgroundBottom.addColorStop(0, "#2f2f2f");
-    backgroundBottom.addColorStop(0.45, "#222222");
-    backgroundBottom.addColorStop(1, "#121212");
+    backgroundBottom.addColorStop(0, "#242424");
+    backgroundBottom.addColorStop(0.45, "#181818");
+    backgroundBottom.addColorStop(1, "#0e0e0e");
 
     this.ctx.fillStyle = backgroundTop;
     this.drawRoundedRect(topRect.x, topRect.y, topRect.width, topRect.height, radius);
@@ -988,14 +1259,14 @@ class FlipBoardRenderer {
     this.drawRoundedRect(bottomRect.x, bottomRect.y, bottomRect.width, bottomRect.height, radius);
     this.ctx.fill();
 
-    this.ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    this.ctx.strokeStyle = "rgba(255,255,255,0.1)";
     this.ctx.lineWidth = 1;
     this.drawRoundedRect(topRect.x + 0.5, topRect.y + 0.5, topRect.width - 1, topRect.height - 1, radius);
     this.ctx.stroke();
     this.drawRoundedRect(bottomRect.x + 0.5, bottomRect.y + 0.5, bottomRect.width - 1, bottomRect.height - 1, radius);
     this.ctx.stroke();
 
-    this.ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    this.ctx.strokeStyle = "rgba(255,255,255,0.07)";
     this.ctx.beginPath();
     this.ctx.moveTo(topRect.x + 1, topRect.y + 1.5);
     this.ctx.lineTo(topRect.x + topRect.width - 1, topRect.y + 1.5);
@@ -1006,15 +1277,24 @@ class FlipBoardRenderer {
     this.ctx.fillStyle = "#020202";
     this.ctx.fillRect(x + insetX, splitY - cardGap / 2, width - insetX * 2, cardGap);
 
-    const firstHalf = clamp(progress * 2, 0, 1);
-    const secondHalf = clamp((progress - 0.5) * 2, 0, 1);
+    const easedProgress = progress < 0.5
+      ? 4 * progress * progress * progress
+      : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+    const firstHalf = clamp(easedProgress * 2, 0, 1);
+    const secondHalf = clamp((easedProgress - 0.5) * 2, 0, 1);
 
-    if (progress < 0.5) {
+    if (easedProgress < 0.5) {
       this.drawStaticChar(x, y, width, height, fromChar, topRect, bottomRect, radius);
       this.drawTopFlap(x, y, width, height, fromChar, 1 - firstHalf, topRect, radius);
-    } else if (progress < 1) {
+      this.ctx.fillStyle = `rgba(0, 0, 0, ${0.14 + firstHalf * 0.26})`;
+      this.drawRoundedRect(bottomRect.x, bottomRect.y, bottomRect.width, bottomRect.height, radius);
+      this.ctx.fill();
+    } else if (easedProgress < 1) {
       this.drawStaticChar(x, y, width, height, toChar, topRect, bottomRect, radius);
       this.drawBottomFlap(x, y, width, height, toChar, secondHalf, bottomRect, radius);
+      this.ctx.fillStyle = `rgba(0, 0, 0, ${0.1 + (1 - secondHalf) * 0.24})`;
+      this.drawRoundedRect(topRect.x, topRect.y, topRect.width, topRect.height, radius);
+      this.ctx.fill();
     } else {
       this.drawStaticChar(x, y, width, height, toChar, topRect, bottomRect, radius);
     }
@@ -1044,11 +1324,13 @@ class FlipBoardRenderer {
     this.ctx.save();
     this.drawRoundedRect(topRect.x, topRect.y, topRect.width, topRect.height, radius);
     this.ctx.clip();
-    this.ctx.translate(0, y + height / 2);
-    this.ctx.scale(1, Math.max(scaleY, 0.02));
-    this.ctx.translate(0, -(y + height / 2));
+    const fold = 1 - clamp(scaleY, 0, 1);
+    const hingeY = y + height / 2;
+    this.ctx.translate(x + width / 2, hingeY);
+    this.ctx.scale(1 - fold * 0.12, Math.max(scaleY, 0.02));
+    this.ctx.translate(-(x + width / 2), -hingeY);
     this.drawHalfChar(x, y, width, height, char, "top", 1, topRect, radius);
-    this.ctx.fillStyle = `rgba(0, 0, 0, ${0.16 + (1 - scaleY) * 0.36})`;
+    this.ctx.fillStyle = `rgba(0, 0, 0, ${0.24 + fold * 0.62})`;
     this.drawRoundedRect(topRect.x, topRect.y, topRect.width, topRect.height, radius);
     this.ctx.fill();
     this.ctx.restore();
@@ -1058,11 +1340,16 @@ class FlipBoardRenderer {
     this.ctx.save();
     this.drawRoundedRect(bottomRect.x, bottomRect.y, bottomRect.width, bottomRect.height, radius);
     this.ctx.clip();
-    this.ctx.translate(0, y + height / 2);
-    this.ctx.scale(1, Math.max(scaleY, 0.02));
-    this.ctx.translate(0, -(y + height / 2));
+    const fold = 1 - clamp(scaleY, 0, 1);
+    const hingeY = y + height / 2;
+    this.ctx.translate(x + width / 2, hingeY);
+    this.ctx.scale(1 - fold * 0.12, Math.max(scaleY, 0.02));
+    this.ctx.translate(-(x + width / 2), -hingeY);
     this.drawHalfChar(x, y, width, height, char, "bottom", 1, bottomRect, radius);
-    this.ctx.fillStyle = `rgba(255, 255, 255, ${0.1 * (1 - scaleY)})`;
+    this.ctx.fillStyle = `rgba(255, 255, 255, ${0.2 * fold})`;
+    this.drawRoundedRect(bottomRect.x, bottomRect.y, bottomRect.width, bottomRect.height, radius);
+    this.ctx.fill();
+    this.ctx.fillStyle = `rgba(0, 0, 0, ${0.14 + fold * 0.36})`;
     this.drawRoundedRect(bottomRect.x, bottomRect.y, bottomRect.width, bottomRect.height, radius);
     this.ctx.fill();
     this.ctx.restore();
