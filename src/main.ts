@@ -112,7 +112,7 @@ const bulkDataTextarea = document.querySelector("#bulkDataTextarea");
 const ctx = canvas.getContext("2d");
 
 const tileState = new Map();
-const resizeObserver = new ResizeObserver(() => renderer.render(performance.now()));
+const resizeObserver = new ResizeObserver(() => renderNow());
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -442,7 +442,7 @@ function updateState(mutator) {
   syncRowsToColumns();
   renderControls();
   renderer.invalidateLayout();
-  renderer.render(performance.now());
+  renderNow();
 }
 
 function moveItem(list, from, to) {
@@ -744,7 +744,7 @@ function renderControls() {
         renderControls();
       }
       renderer.invalidateLayout();
-      renderer.render(performance.now());
+      renderNow();
     });
   });
 
@@ -754,7 +754,7 @@ function renderControls() {
       const { number } = event.currentTarget.dataset;
       state[number] = event.currentTarget.type === "checkbox" ? event.currentTarget.checked : Number(event.currentTarget.value);
       renderer.invalidateLayout();
-      renderer.render(performance.now());
+      renderNow();
     });
   });
 
@@ -841,7 +841,7 @@ function handleControlAction(event) {
     if (state.displayMode === "articles" && articles.length > 0) {
       state.articleIndex = pickRandomArticleIndex(state.articleIndex);
       renderer.invalidateLayout();
-      renderer.render(performance.now());
+      renderNow();
     }
     return;
   }
@@ -1532,6 +1532,40 @@ class FlipBoardRenderer {
 const renderer = new FlipBoardRenderer(ctx, canvas, viewportEl);
 document.querySelector('[data-action="randomize"]').addEventListener("click", handleControlAction);
 
+let activeRafId = 0;
+
+function hasActiveTileAnimations() {
+  for (const tile of tileState.values()) {
+    if (tile.startedAt > 0 || tile.pendingChars.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function animationFrameTick(now) {
+  renderer.render(now);
+  if (hasActiveTileAnimations()) {
+    activeRafId = requestAnimationFrame(animationFrameTick);
+  } else {
+    activeRafId = 0;
+  }
+}
+
+function ensureAnimationLoop() {
+  if (activeRafId !== 0) {
+    return;
+  }
+  activeRafId = requestAnimationFrame(animationFrameTick);
+}
+
+function renderNow() {
+  renderer.render(performance.now());
+  if (hasActiveTileAnimations()) {
+    ensureAnimationLoop();
+  }
+}
+
 fullscreenButton.addEventListener("click", async () => {
   if (document.fullscreenElement === canvas) {
     await document.exitFullscreen();
@@ -1553,20 +1587,15 @@ document.addEventListener("fullscreenchange", () => {
   if (document.fullscreenElement === canvas) {
     renderer.replayAllTiles();
   }
-  renderer.render(performance.now());
+  renderNow();
 });
 
 resizeObserver.observe(viewportEl);
-window.addEventListener("resize", () => renderer.render(performance.now()));
-
-function tick(now) {
-  renderer.render(now);
-  requestAnimationFrame(tick);
-}
+window.addEventListener("resize", () => renderNow());
 
 renderControls();
 renderer.invalidateLayout();
-requestAnimationFrame(tick);
+renderNow();
 
 const AUTO_REFRESH_MS = 20000;
 setInterval(() => {
@@ -1578,7 +1607,7 @@ setInterval(() => {
       state.articleIndex = pickRandomArticleIndex(state.articleIndex);
     }
     renderer.invalidateLayout();
-    renderer.render(performance.now());
+    renderNow();
     return;
   }
   randomizeRows();
