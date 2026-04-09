@@ -1,7 +1,8 @@
 // @ts-nocheck // 临时关闭 TS 类型检查
 import "./styles.scss";
+import articles from "./articles";
 
-const CHARSET = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:/-*#";
+const CHARSET = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:/-*#',;!?\"";
 const FONT_STACK = '"JetBrains Mono Local", monospace';
 const NARROW_TIME_RATIO = 0.42;
 const FONT_OPTIONS = [
@@ -17,6 +18,8 @@ function makeId() {
 }
 
 const state = {
+  displayMode: "airport", // airport | articles — 机场看板 / 金句翻牌（无列、无标签）。
+  articleIndex: 0,
   title: "出发航班", // 看板标题文本。
   fontFamily: FONT_STACK, // 翻牌字符使用的主字体栈。
   charWidth: 42, // 单个字符格宽度。
@@ -34,16 +37,17 @@ const state = {
   columns: [
     { id: makeId(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
     { id: makeId(), label: "目的地", key: "destination", type: "text", length: 14, align: "left" },
+    { id: makeId(), label: "国家", key: "country", type: "text", length: 3, align: "left" },
     { id: makeId(), label: "航班", key: "flight", type: "text", length: 6, align: "left" },
-    { id: makeId(), label: "登机口", key: "gate", type: "text", length: 2, align: "right" },
     { id: makeId(), label: "状态", key: "active", type: "status" },
+    { id: makeId(), label: "登机口", key: "gate", type: "text", length: 2, align: "right" },
   ],
   rows: [
-    { id: makeId(), time: "18:35", destination: "Jakarta", flight: "SQ0166", gate: "07", active: true },
-    { id: makeId(), time: "18:45", destination: "Penang", flight: "SQ0198", gate: "07", active: true },
-    { id: makeId(), time: "18:50", destination: "Dhaka", flight: "SQ0436", gate: "11", active: false },
-    { id: makeId(), time: "18:55", destination: "Kuala Lumpur", flight: "MH6176", gate: "14", active: true },
-    { id: makeId(), time: "19:00", destination: "Hong Kong", flight: "SQ0868", gate: "18", active: false },
+    { id: makeId(), time: "18:35", destination: "Jakarta", country: "IDN", flight: "SQ0166", gate: "07", active: true },
+    { id: makeId(), time: "18:45", destination: "Penang", country: "MYS", flight: "SQ0198", gate: "07", active: true },
+    { id: makeId(), time: "18:50", destination: "Dhaka", country: "BGD", flight: "SQ0436", gate: "11", active: false },
+    { id: makeId(), time: "18:55", destination: "Kuala Lumpur", country: "MYS", flight: "MH6176", gate: "14", active: true },
+    { id: makeId(), time: "19:00", destination: "Hong Kong", country: "CHN", flight: "SQ0868", gate: "18", active: false },
   ],
 };
 
@@ -146,6 +150,180 @@ function getSlotWidths(column) {
 
 function isTimeColonSlot(column, charIndex) {
   return column.type === "text" && column.key === "time" && column.length === 5 && charIndex === 2;
+}
+
+const ARTICLE_COLUMN_ID = "article-quote-column";
+/** 金句模式 canvas 内四周留白（像素），句子与整屏翻牌格均在此边距内排版。 */
+const ARTICLE_CANVAS_INSET_PX = 20;
+/** 句子正文区左右各保留的空白字符列数（在已扣除 canvas inset 的网格内）。 */
+const ARTICLE_TEXT_SIDE_MARGIN_COLS = 5;
+/** 金句模式字距（列间距）下限（像素），优先满足后再分配剩余宽度。 */
+const ARTICLE_MIN_TILE_GAP_PX = 5;
+/** 金句模式行距下限（像素），优先满足后再分配剩余高度。 */
+const ARTICLE_MIN_ROW_GAP_PX = 10;
+/** 金句模式字距上限（像素），避免在超大屏时格子过于稀疏。 */
+const ARTICLE_MAX_TILE_GAP_PX = 48;
+/** 金句模式行距上限（像素），避免在超大屏时行间过于松散。 */
+const ARTICLE_MAX_ROW_GAP_PX = 48;
+
+/**
+ * 在单轴（宽或高）上，在最小/最大间距约束下放入尽可能多的格子，并分配间距。
+ */
+function fitArticleAxis(innerPx, cellPx, gapMin, gapMax) {
+  const maxCount = Math.floor(innerPx / cellPx);
+  if (maxCount < 1) {
+    return { count: 1, gap: 0, total: Math.max(0, innerPx) };
+  }
+
+  for (let n = maxCount; n >= 2; n -= 1) {
+    const minSum = n * cellPx + (n - 1) * gapMin;
+    if (minSum > innerPx + 1e-6) {
+      continue;
+    }
+    let gap = (innerPx - n * cellPx) / (n - 1);
+    if (gap < gapMin - 1e-6) {
+      continue;
+    }
+    if (gap > gapMax) {
+      gap = gapMax;
+    }
+    const total = n * cellPx + (n - 1) * gap;
+    return { count: n, gap, total };
+  }
+
+  if (cellPx <= innerPx) {
+    return { count: 1, gap: 0, total: cellPx };
+  }
+
+  return { count: 1, gap: 0, total: innerPx };
+}
+
+/**
+ * 在扣除四周 inset 后的矩形内，按最小字距/行距约束再分配剩余空间（仅金句模式使用）。
+ */
+function computeArticleGridFill(innerW, innerH) {
+  const cw = state.charWidth;
+  const ch = state.charHeight;
+
+  const h = fitArticleAxis(innerW, cw, ARTICLE_MIN_TILE_GAP_PX, ARTICLE_MAX_TILE_GAP_PX);
+  const v = fitArticleAxis(innerH, ch, ARTICLE_MIN_ROW_GAP_PX, ARTICLE_MAX_ROW_GAP_PX);
+
+  return {
+    gridCols: h.count,
+    gridRows: v.count,
+    tileGap: h.gap,
+    rowGap: v.gap,
+    totalW: h.total,
+    totalH: v.total,
+  };
+}
+
+function wrapArticleText(rawText, maxChars) {
+  // 以单词为单位换行；超长单词按 maxChars 强制切段。
+  const text = String(rawText ?? "").trim();
+  if (!text) {
+    return [""];
+  }
+
+  const upper = text.toUpperCase();
+  const words = upper.split(/\s+/).filter(Boolean);
+  const lines = [];
+  let current = "";
+
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length <= maxChars) {
+      current = candidate;
+      continue;
+    }
+
+    if (current) {
+      lines.push(current);
+    }
+
+    if (word.length > maxChars) {
+      let rest = word;
+      while (rest.length > maxChars) {
+        lines.push(rest.slice(0, maxChars));
+        rest = rest.slice(maxChars);
+      }
+      current = rest;
+    } else {
+      current = word;
+    }
+  }
+
+  if (current) {
+    lines.push(current);
+  }
+
+  return lines.length ? lines : [""];
+}
+
+function computeArticleLayout(text, maxLineChars, maxRows) {
+  // 在行数限制内找到最大可用单行字符数，让句子尽量少换行。
+  let lo = 1;
+  let hi = maxLineChars;
+  let bestW = 1;
+
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const lineCount = wrapArticleText(text, mid).length;
+    // 二分：在不超过 maxRows 行前提下，尽量增大单行字符数。
+    if (lineCount <= maxRows) {
+      bestW = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  if (wrapArticleText(text, maxLineChars).length > maxRows) {
+    bestW = maxLineChars;
+  }
+
+  const lines = wrapArticleText(text, bestW);
+  return { lines, wrapWidth: bestW };
+}
+
+function buildColumnsLayout(columnsConfig, startX = state.boardPadding, tileGapForSlots = state.tileGap) {
+  // tileGapForSlots 允许金句模式使用独立的动态字距，不影响机场模式全局字距。
+  let currentX = startX;
+
+  const columns = columnsConfig.map((column) => {
+    if (column.type === "status") {
+      const width = state.charHeight * 0.64;
+      const layout = {
+        ...column,
+        x: currentX,
+        width,
+      };
+
+      currentX += width + state.columnGap;
+      return layout;
+    }
+
+    const slotWidths = getSlotWidths(column);
+    let slotX = 0;
+    const slots = slotWidths.map((width, index) => {
+      const slot = { x: slotX, width };
+      slotX += width + (index < slotWidths.length - 1 ? tileGapForSlots : 0);
+      return slot;
+    });
+
+    const layout = {
+      ...column,
+      x: currentX,
+      slots,
+      width: slotX,
+    };
+
+    currentX += slotX + state.columnGap;
+    return layout;
+  });
+
+  const contentRight = columns.length ? columns.at(-1).x + columns.at(-1).width : startX;
+  return { columns, contentRight };
 }
 
 function buildRollSequence(fromChar, toChar) {
@@ -263,7 +441,7 @@ function updateState(mutator) {
   mutator(state);
   syncRowsToColumns();
   renderControls();
-  renderer.syncTargets();
+  renderer.invalidateLayout();
   renderer.render(performance.now());
 }
 
@@ -285,6 +463,7 @@ function randomToken(length) {
 
 function randomizeRows() {
   const destinations = ["Jakarta", "Penang", "Dhaka", "Kuala Lumpur", "Hong Kong", "Phuket", "Bali", "Kuching"];
+  const countries = ["IDN", "MYS", "BGD", "MYS", "CHN", "THA", "IDN", "MYS"];
 
   updateState((draft) => {
     draft.rows.forEach((row, rowIndex) => {
@@ -298,6 +477,8 @@ function randomizeRows() {
           row[column.key] = `${18 + rowIndex}:${String(Math.floor(Math.random() * 6) * 5).padStart(2, "0")}`;
         } else if (column.key === "destination") {
           row[column.key] = destinations[Math.floor(Math.random() * destinations.length)];
+        } else if (column.key === "country") {
+          row[column.key] = countries[Math.floor(Math.random() * countries.length)];
         } else if (column.key === "flight") {
           row[column.key] = `${String.fromCharCode(65 + Math.floor(Math.random() * 26))}${String.fromCharCode(
             65 + Math.floor(Math.random() * 26),
@@ -385,14 +566,45 @@ function applyBulkData() {
 }
 
 function renderControls() {
+  const airportMode = state.displayMode === "airport";
   controlsEl.innerHTML = `
+    <section class="setup-group">
+      <h3>显示模式</h3>
+      <div class="mode-radio-group" role="radiogroup" aria-label="显示模式">
+        <label class="mode-radio">
+          <input data-path="displayMode" type="radio" name="displayMode" value="airport" ${
+            state.displayMode === "airport" ? "checked" : ""
+          } />
+          <span>机场看板</span>
+        </label>
+        <label class="mode-radio">
+          <input data-path="displayMode" type="radio" name="displayMode" value="articles" ${
+            state.displayMode === "articles" ? "checked" : ""
+          } />
+          <span>金句翻牌</span>
+        </label>
+      </div>
+      ${
+        !airportMode
+          ? `<p class="setup-hint">金句模式：整块画布为翻牌格；句子区四周固定 20px 边距（全屏/窗口切换会重算）；字距不低于 5px、行距不低于 10px，再分配剩余空间；按 <strong>articles</strong> 每 20 秒切换。</p>
+      <div class="button-row">
+        <button type="button" class="ghost-button" data-action="next-article">下一句</button>
+      </div>`
+          : ""
+      }
+    </section>
+
     <section class="setup-group">
       <h3>看板</h3>
       <div class="form-grid">
-        <label class="field">
+        ${
+          airportMode
+            ? `<label class="field">
           <span>标题</span>
           <input data-path="title" type="text" value="${escapeHtml(state.title)}" />
-        </label>
+        </label>`
+            : ""
+        }
         <label class="field">
           <span>字体</span>
           <select data-path="fontFamily">
@@ -447,7 +659,9 @@ function renderControls() {
       </div>
     </section>
 
-    <section class="setup-group">
+    ${
+      airportMode
+        ? `<section class="setup-group">
       <div class="section-heading">
         <h3>列配置</h3>
         <div class="button-row">
@@ -515,15 +729,21 @@ function renderControls() {
           )
           .join("")}
       </div>
-    </section>
+    </section>`
+        : ""
+    }
 
   `;
 
   controlsEl.querySelectorAll("[data-path]").forEach((input) => {
-    const eventName = input.tagName === "SELECT" ? "change" : "input";
+    const eventName = input.tagName === "SELECT" || input.type === "radio" ? "change" : "input";
     input.addEventListener(eventName, (event) => {
       const { path } = event.currentTarget.dataset;
       state[path] = event.currentTarget.value;
+      if (path === "displayMode") {
+        renderControls();
+      }
+      renderer.invalidateLayout();
       renderer.render(performance.now());
     });
   });
@@ -533,7 +753,7 @@ function renderControls() {
     input.addEventListener(eventName, (event) => {
       const { number } = event.currentTarget.dataset;
       state[number] = event.currentTarget.type === "checkbox" ? event.currentTarget.checked : Number(event.currentTarget.value);
-      renderer.syncTargets();
+      renderer.invalidateLayout();
       renderer.render(performance.now());
     });
   });
@@ -585,6 +805,25 @@ function renderControls() {
   controlsEl.querySelectorAll("[data-action]").forEach((button) => {
     button.addEventListener("click", handleControlAction);
   });
+
+  const randomizeHeaderBtn = document.querySelector('.setup-panel__header [data-action="randomize"]');
+  if (randomizeHeaderBtn) {
+    randomizeHeaderBtn.hidden = !airportMode;
+  }
+  if (dataPageButton) {
+    dataPageButton.hidden = !airportMode;
+  }
+}
+
+function pickRandomArticleIndex(currentIndex) {
+  if (articles.length <= 1) {
+    return 0;
+  }
+  let nextIndex = currentIndex;
+  while (nextIndex === currentIndex) {
+    nextIndex = Math.floor(Math.random() * articles.length);
+  }
+  return nextIndex;
 }
 
 function handleControlAction(event) {
@@ -592,7 +831,18 @@ function handleControlAction(event) {
   const itemIndex = Number(index);
 
   if (action === "randomize") {
-    randomizeRows();
+    if (state.displayMode === "airport") {
+      randomizeRows();
+    }
+    return;
+  }
+
+  if (action === "next-article") {
+    if (state.displayMode === "articles" && articles.length > 0) {
+      state.articleIndex = pickRandomArticleIndex(state.articleIndex);
+      renderer.invalidateLayout();
+      renderer.render(performance.now());
+    }
     return;
   }
 
@@ -660,6 +910,7 @@ function getCanvasColumnLabel(column) {
   const builtinLabels = {
     time: "TIME",
     destination: "DESTINATION",
+    country: "COUNTRY",
     flight: "FLIGHT",
     gate: "GATE",
     pair: "PAIR",
@@ -686,11 +937,13 @@ class FlipBoardRenderer {
     this.cachedViewportWidth = 0;
     this.cachedViewportHeight = 0;
     this.cachedLayout = null;
-    this.syncTargets();
+    this.cachedLayoutStamp = null;
+    this.invalidateLayout();
   }
 
   invalidateLayout() {
     this.cachedLayout = null;
+    this.cachedLayoutStamp = null;
   }
 
   resizeCanvas(cssWidth, cssHeight) {
@@ -721,68 +974,121 @@ class FlipBoardRenderer {
   }
 
   getCachedLayout(viewportWidth, viewportHeight) {
-    if (
-      !this.cachedLayout ||
-      this.cachedViewportWidth !== viewportWidth ||
-      this.cachedViewportHeight !== viewportHeight
-    ) {
+    // 全屏状态也纳入缓存 key，避免全屏进出尺寸相同却复用旧布局。
+    const fullscreenTag = document.fullscreenElement === this.canvas ? "fs1" : "fs0";
+    const layoutStamp = `${state.displayMode}:${state.displayMode === "articles" ? state.articleIndex : "a"}:${fullscreenTag}:${viewportWidth}x${viewportHeight}`;
+    if (!this.cachedLayout || this.cachedLayoutStamp !== layoutStamp) {
+      this.cachedLayoutStamp = layoutStamp;
       this.cachedViewportWidth = viewportWidth;
       this.cachedViewportHeight = viewportHeight;
-      this.cachedLayout = this.getLayout();
+      this.cachedLayout = this.getLayout(viewportWidth, viewportHeight);
     }
     return this.cachedLayout;
   }
 
-  getLayout() {
-    let currentX = state.boardPadding;
+  getLayout(viewportWidth, viewportHeight) {
+    if (state.displayMode === "articles") {
+      const articleText = articles[state.articleIndex]?.text ?? "";
+      // 先在 canvas 内部预留固定边距，再在内层区域计算金句网格。
+      const inset = ARTICLE_CANVAS_INSET_PX;
+      const innerW = Math.max(1, viewportWidth - inset * 2);
+      const innerH = Math.max(1, viewportHeight - inset * 2);
 
-    const columns = state.columns.map((column) => {
-      if (column.type === "status") {
-        const width = state.charHeight * 0.64;
-        const layout = {
-          ...column,
-          x: currentX,
-          width,
-        };
+      const { gridCols, gridRows, tileGap: articleTileGap, rowGap: articleRowGap, totalW, totalH } = computeArticleGridFill(
+        innerW,
+        innerH,
+      );
 
-        currentX += width + state.columnGap;
-        return layout;
-      }
+      const sideMarginCols = Math.min(
+        ARTICLE_TEXT_SIDE_MARGIN_COLS,
+        Math.max(0, Math.floor((gridCols - 1) / 2)),
+      );
+      // 句子正文区可用列数（扣除左右保留空白列）。
+      const innerCols = Math.max(1, gridCols - sideMarginCols * 2);
 
-      const slotWidths = getSlotWidths(column);
-      let slotX = 0;
-      const slots = slotWidths.map((width, index) => {
-        const slot = { x: slotX, width };
-        slotX += width + (index < slotWidths.length - 1 ? state.tileGap : 0);
-        return slot;
-      });
+      const { lines: contentLines } = computeArticleLayout(articleText, innerCols, gridRows);
+      const displayLines = contentLines.length > gridRows ? contentLines.slice(0, gridRows) : contentLines;
 
-      const layout = {
-        ...column,
-        x: currentX,
-        slots,
-        width: slotX,
+      const articleColumn = {
+        id: ARTICLE_COLUMN_ID,
+        label: "",
+        key: "text",
+        type: "text",
+        length: gridCols,
+        align: "center",
       };
 
-      currentX += slotX + state.columnGap;
-      return layout;
-    });
+      const { columns, contentRight } = buildColumnsLayout([articleColumn], 0, articleTileGap);
+      const padTop = Math.max(0, Math.floor((gridRows - displayLines.length) / 2));
+      const rows = [];
 
-    const contentRight = columns.length ? columns.at(-1).x + columns.at(-1).width : state.boardPadding;
-    const boardWidth = contentRight + state.boardPadding;
+      for (let r = 0; r < gridRows; r += 1) {
+        const id = `article-grid-${r}`;
+        const inBlock = r >= padTop && r < padTop + displayLines.length;
+        // 整行均为翻牌格；句子行为「左右留白列 + 居中文本」。
+        const textRow = inBlock
+          ? `${" ".repeat(sideMarginCols)}${fitText(displayLines[r - padTop], innerCols, "center")}${" ".repeat(
+              gridCols - sideMarginCols - innerCols,
+            )}`
+          : fitText("", gridCols, "left");
+        rows.push({ id, text: textRow });
+      }
+
+      const rowHeight = state.charHeight;
+      const rowsHeight = rowHeight * gridRows + articleRowGap * Math.max(gridRows - 1, 0);
+      const boardHeight = inset * 2 + rowsHeight;
+      const boardWidth = contentRight + inset;
+      const blockWidth = contentRight;
+      // 在 20px inset 内把整块翻牌网格做二次居中，消化除不尽的剩余像素。
+      const contentOffsetX = inset + (innerW - totalW) / 2;
+      const contentTopOffset = inset + (innerH - totalH) / 2;
+
+      return {
+        mode: "articles",
+        columns,
+        rows,
+        boardWidth,
+        boardHeight,
+        rowHeight,
+        contentRight,
+        contentTopOffset,
+        contentOffsetX,
+        articleTileGap,
+        articleRowGap,
+        articleInset: inset,
+        showHeader: false,
+      };
+    }
+
+    const { columns, contentRight } = buildColumnsLayout(state.columns);
     const rowHeight = state.charHeight;
     const rowsHeight = rowHeight * state.rows.length + state.rowGap * Math.max(state.rows.length - 1, 0);
     const boardHeight = state.boardPadding * 2 + state.titleHeight + state.labelHeight + rowsHeight;
+    const boardWidth = contentRight + state.boardPadding;
+    const contentTopOffset = state.boardPadding + state.titleHeight + state.labelHeight;
 
-    return { columns, boardWidth, boardHeight, rowHeight, contentRight };
+    return {
+      mode: "airport",
+      columns,
+      rows: state.rows,
+      boardWidth,
+      boardHeight,
+      rowHeight,
+      contentRight,
+      contentTopOffset,
+      contentOffsetX: 0,
+      articleTileGap: null,
+      articleRowGap: null,
+      articleInset: null,
+      showHeader: true,
+    };
   }
 
-  syncTargets() {
-    this.invalidateLayout();
+  applyTileSync(layout) {
     const activeKeys = new Set();
 
-    state.rows.forEach((row) => {
-      state.columns.forEach((column) => {
+    layout.rows.forEach((row) => {
+      layout.columns.forEach((column) => {
         if (column.type !== "text") {
           return;
         }
@@ -835,6 +1141,10 @@ class FlipBoardRenderer {
     });
   }
 
+  syncTargets() {
+    this.invalidateLayout();
+  }
+
   replayAllTiles() {
     const startedAt = performance.now();
 
@@ -849,7 +1159,9 @@ class FlipBoardRenderer {
     const viewportHeight = isFullscreen ? window.innerHeight : this.viewport.clientHeight;
     const canvasWidth = Math.max(320, Math.floor(viewportWidth));
     const canvasHeight = Math.max(240, Math.floor(viewportHeight));
-    const { columns, rowHeight, contentRight } = this.getCachedLayout(canvasWidth, canvasHeight);
+    const layout = this.getCachedLayout(canvasWidth, canvasHeight);
+
+    this.applyTileSync(layout);
 
     this.resizeCanvas(canvasWidth, canvasHeight);
 
@@ -857,8 +1169,8 @@ class FlipBoardRenderer {
     this.ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
     this.drawBoardBackground(canvasWidth, canvasHeight);
-    this.drawHeader(columns);
-    this.drawRows(columns, rowHeight, now, canvasWidth, canvasHeight, contentRight);
+    this.drawHeader(layout);
+    this.drawRows(layout, now, canvasWidth, canvasHeight);
   }
 
   drawBoardBackground(width, height) {
@@ -875,7 +1187,12 @@ class FlipBoardRenderer {
     this.ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
   }
 
-  drawHeader(columns) {
+  drawHeader(layout) {
+    if (!layout.showHeader) {
+      return;
+    }
+
+    const columns = layout.columns;
     this.ctx.fillStyle = "#d8d8d8";
     this.ctx.font = `600 12px Inter, system-ui, sans-serif`;
     this.ctx.textBaseline = "middle";
@@ -896,24 +1213,32 @@ class FlipBoardRenderer {
     });
   }
 
-  drawRows(columns, rowHeight, now, canvasWidth, canvasHeight, contentRight) {
-    const top = state.boardPadding + state.titleHeight + state.labelHeight;
-    const bottomLimit = canvasHeight - state.boardPadding;
+  drawRows(layout, now, canvasWidth, canvasHeight) {
+    const columns = layout.columns;
+    const rowHeight = layout.rowHeight;
+    const contentRight = layout.contentRight;
+    const ox = layout.contentOffsetX ?? 0;
+    const top = layout.contentTopOffset;
+    const isArticles = layout.mode === "articles";
+    const articleInset = layout.articleInset ?? 0;
+    const rowGap = isArticles && layout.articleRowGap != null ? layout.articleRowGap : state.rowGap;
+    const bottomLimit = isArticles ? canvasHeight - articleInset : canvasHeight - state.boardPadding;
     const rightLimit = canvasWidth - state.boardPadding;
-    const rowStride = rowHeight + state.rowGap;
-    const rowsPerPage = Math.max(1, Math.floor((bottomLimit - top + state.rowGap) / rowStride));
+    const rowStride = rowHeight + rowGap;
+    const rowsPerPage = Math.max(1, Math.floor((bottomLimit - top + rowGap) / rowStride));
+    const rowLimit = isArticles ? layout.rows.length : rowsPerPage;
 
-    for (let rowIndex = 0; rowIndex < rowsPerPage; rowIndex += 1) {
+    for (let rowIndex = 0; rowIndex < rowLimit; rowIndex += 1) {
       const y = top + rowIndex * rowStride;
       if (y + rowHeight > bottomLimit) {
         break;
       }
 
-      const row = state.rows[rowIndex];
+      const row = layout.rows[rowIndex];
 
       columns.forEach((column) => {
         if (column.type === "status") {
-          this.drawStatusBulb(column.x, y, rowHeight, row ? Boolean(row[column.key]) : false, !row);
+          this.drawStatusBulb(column.x + ox, y, rowHeight, row ? Boolean(row[column.key]) : false, !row);
         } else {
           const fitted = fitText(row?.[column.key] ?? "", column.length, column.align);
           for (let charIndex = 0; charIndex < column.length; charIndex += 1) {
@@ -921,7 +1246,7 @@ class FlipBoardRenderer {
             const charValue = isStaticTimeColon ? ":" : sanitizeChar(fitted[charIndex]);
             const tile = row && !isStaticTimeColon ? tileState.get(`${row.id}:${column.id}:${charIndex}`) : null;
             const slot = column.slots[charIndex];
-            const tileX = column.x + slot.x;
+            const tileX = column.x + slot.x + ox;
             const tileY = y;
             if (isStaticTimeColon) {
               this.drawTimeSeparatorDots(tileX, tileY, slot.width, state.charHeight);
@@ -932,7 +1257,11 @@ class FlipBoardRenderer {
         }
       });
 
-      let fillerX = contentRight + state.columnGap;
+      if (isArticles) {
+        continue;
+      }
+
+      let fillerX = contentRight + state.columnGap + ox;
       while (fillerX + state.charWidth <= rightLimit) {
         this.drawTile(fillerX, y, state.charWidth, state.charHeight, null, " ", now);
         fillerX += state.charWidth + state.tileGap;
@@ -1220,10 +1549,11 @@ reloadDataPageButton.addEventListener("click", () => {
 applyDataPageButton.addEventListener("click", applyBulkData);
 
 document.addEventListener("fullscreenchange", () => {
+  renderer.invalidateLayout();
   if (document.fullscreenElement === canvas) {
     renderer.replayAllTiles();
-    renderer.render(performance.now());
   }
+  renderer.render(performance.now());
 });
 
 resizeObserver.observe(viewportEl);
@@ -1235,5 +1565,21 @@ function tick(now) {
 }
 
 renderControls();
-renderer.syncTargets();
+renderer.invalidateLayout();
 requestAnimationFrame(tick);
+
+const AUTO_REFRESH_MS = 20000;
+setInterval(() => {
+  if (!dataPage.classList.contains("hidden")) {
+    return;
+  }
+  if (state.displayMode === "articles") {
+    if (articles.length > 0) {
+      state.articleIndex = pickRandomArticleIndex(state.articleIndex);
+    }
+    renderer.invalidateLayout();
+    renderer.render(performance.now());
+    return;
+  }
+  randomizeRows();
+}, AUTO_REFRESH_MS);
