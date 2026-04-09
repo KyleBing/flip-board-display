@@ -1,6 +1,5 @@
 // @ts-nocheck // 临时关闭 TS 类型检查
 import "./styles.scss";
-import { createOkxWsClient } from "./ws";
 
 const CHARSET = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:/-*#";
 const FONT_STACK = '"JetBrains Mono Local", monospace';
@@ -9,7 +8,6 @@ const FONT_OPTIONS = [
   { label: "JetBrains Mono（本地）", value: '"JetBrains Mono Local", monospace' },
   { label: "Roboto Mono（本地）", value: '"Roboto Mono Local", monospace' },
 ];
-const WS_SOURCE_OPTIONS = [{ label: "OKX", value: "okx" }];
 
 function makeId() {
   if (globalThis.crypto?.randomUUID) {
@@ -33,10 +31,6 @@ const state = {
   labelHeight: 26, // 列标题区域高度。
   titleHeight: 34, // 看板标题区域高度。
   flipDuration: 500, // 基础翻页时长（毫秒）。
-  wsEnabled: false, // 是否启用 WebSocket 实时数据。
-  wsSource: "okx", // WebSocket 数据源。
-  wsSymbols: "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,ADA-USDT,XRP-USDT,DOGE-USDT,TRX-USDT,LTC-USDT,LINK-USDT", // 订阅交易对列表。
-  wsStatus: "未连接", // 连接状态展示。
   columns: [
     { id: makeId(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
     { id: makeId(), label: "目的地", key: "destination", type: "text", length: 14, align: "left" },
@@ -115,11 +109,6 @@ const ctx = canvas.getContext("2d");
 
 const tileState = new Map();
 const resizeObserver = new ResizeObserver(() => renderer.render(performance.now()));
-const wsDecimalCache = new Map();
-const wsUpdateCounter = new Map();
-const wsActivityScore = new Map();
-const wsLastPriceMap = new Map();
-const WS_MAX_ROWS = 10;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -323,171 +312,6 @@ function randomizeRows() {
   });
 }
 
-function getWsColumnPreset() {
-  return [
-    { id: makeId(), label: "时间", key: "time", type: "text", length: 5, align: "right" },
-    { id: makeId(), label: "交易对", key: "pair", type: "text", length: 10, align: "left" },
-    { id: makeId(), label: "最新价", key: "last", type: "text", length: 9, align: "right" },
-    { id: makeId(), label: "状态", key: "active", type: "status" },
-  ];
-}
-
-function hasWsColumnPreset() {
-  const targetKeys = ["time", "pair", "last", "active"];
-  return state.columns.length === targetKeys.length && targetKeys.every((key, index) => state.columns[index]?.key === key);
-}
-
-function applyWsColumnPreset() {
-  if (hasWsColumnPreset()) {
-    return;
-  }
-
-  state.columns = getWsColumnPreset();
-  syncRowsToColumns();
-  renderControls();
-  renderer.syncTargets();
-  renderer.render(performance.now());
-}
-
-function setWsStatus(text) {
-  state.wsStatus = text;
-  const statusEl = document.querySelector("#wsStatusText");
-  if (statusEl) {
-    if ("value" in statusEl) {
-      statusEl.value = text;
-    } else {
-      statusEl.textContent = text;
-    }
-  }
-}
-
-function refreshBoardOnly() {
-  syncRowsToColumns();
-  renderer.syncTargets();
-  renderer.render(performance.now());
-}
-
-function getOrCreateWsRow(symbol) {
-  const pairText = String(symbol ?? "");
-  let row = state.rows.find((item) => String(item.pair ?? "") === pairText);
-  if (!row) {
-    if (state.rows.length >= WS_MAX_ROWS) {
-      return null;
-    }
-    row = makeEmptyRow();
-    row.pair = pairText;
-    state.rows.push(row);
-  }
-  return row;
-}
-
-function sortWsRowsByActivity() {
-  state.rows.sort((a, b) => {
-    const pairA = String(a.pair ?? "");
-    const pairB = String(b.pair ?? "");
-    const scoreA = wsActivityScore.get(pairA) ?? 0;
-    const scoreB = wsActivityScore.get(pairB) ?? 0;
-    if (scoreA !== scoreB) {
-      return scoreB - scoreA;
-    }
-    const countA = wsUpdateCounter.get(pairA) ?? 0;
-    const countB = wsUpdateCounter.get(pairB) ?? 0;
-    if (countA !== countB) {
-      return countB - countA;
-    }
-    return pairA.localeCompare(pairB);
-  });
-}
-
-function applyTickerUpdate(ticker) {
-  const symbol = ticker.symbol;
-  if (!symbol) {
-    return;
-  }
-
-  const activity = Number(ticker.volCcy24h || ticker.vol24h || 0);
-  const row = getOrCreateWsRow(symbol);
-  if (!row) {
-    return;
-  }
-  const now = new Date();
-  const hh = String(now.getHours()).padStart(2, "0");
-  const mm = String(now.getMinutes()).padStart(2, "0");
-  const pairText = symbol;
-  let lastValue = ticker.last ?? "";
-  const previousRowActive = row.active;
-  let isActive = typeof previousRowActive === "boolean" ? previousRowActive : Number(ticker.last || 0) >= Number(ticker.open24h || 0);
-  const currentLastPrice = Number(ticker.last);
-
-  const defaultDecimals = 4;
-  const resolveDecimals = (textValue) => {
-    const cacheKey = `${symbol}:decimals`;
-    if (wsDecimalCache.has(cacheKey)) {
-      return wsDecimalCache.get(cacheKey);
-    }
-    const parts = String(textValue ?? "").split(".");
-    const decimals = parts[1] ? clamp(parts[1].length, 2, 8) : defaultDecimals;
-    wsDecimalCache.set(cacheKey, decimals);
-    return decimals;
-  };
-  const formatStableNumber = (textValue, decimals) => {
-    const numeric = Number(textValue);
-    if (!Number.isFinite(numeric)) {
-      return String(textValue ?? "");
-    }
-    return numeric.toFixed(decimals);
-  };
-  const priceDecimals = resolveDecimals(lastValue);
-  lastValue = formatStableNumber(lastValue, priceDecimals);
-  const previousLastPrice = wsLastPriceMap.get(pairText);
-  if (Number.isFinite(currentLastPrice) && Number.isFinite(previousLastPrice)) {
-    if (currentLastPrice > previousLastPrice) {
-      isActive = true; // 上涨：绿色
-    } else if (currentLastPrice < previousLastPrice) {
-      isActive = false; // 下跌：红色
-    } else {
-      // 价格持平时保持上一跳状态，避免红绿闪回。
-      isActive = typeof previousRowActive === "boolean" ? previousRowActive : isActive;
-    }
-  }
-  if (Number.isFinite(currentLastPrice)) {
-    wsLastPriceMap.set(pairText, currentLastPrice);
-  }
-
-  row.time = `${hh}:${mm}`;
-  row.pair = pairText;
-  row.last = String(lastValue);
-  row.active = Boolean(isActive);
-  wsActivityScore.set(pairText, Number.isFinite(activity) ? activity : 0);
-  wsUpdateCounter.set(pairText, (wsUpdateCounter.get(pairText) ?? 0) + 1);
-  sortWsRowsByActivity();
-
-  refreshBoardOnly();
-}
-
-const wsClient = createOkxWsClient({
-  onStatus: setWsStatus,
-  onTicker: applyTickerUpdate,
-});
-
-function connectMarketSocket() {
-  if (!state.wsEnabled) {
-    return;
-  }
-  applyWsColumnPreset();
-  state.wsSource = "okx";
-  wsUpdateCounter.clear();
-  wsActivityScore.clear();
-  wsLastPriceMap.clear();
-  state.rows = [];
-  refreshBoardOnly();
-  wsClient.connect(state.wsSymbols);
-}
-
-function stopMarketSocket() {
-  wsClient.disconnect();
-}
-
 function serializeRowsForEditor() {
   const keys = state.columns.map((column) => column.key);
   const header = keys.join("|");
@@ -577,28 +401,6 @@ function renderControls() {
                 `<option value="${escapeHtml(option.value)}" ${state.fontFamily === option.value ? "selected" : ""}>${escapeHtml(option.label)}</option>`,
             ).join("")}
           </select>
-        </label>
-      </div>
-    </section>
-
-    <section class="setup-group">
-      <h3>实时数据</h3>
-      <div class="form-grid">
-        <label class="field field--toggle">
-          <span>启用WS</span>
-          <input data-number="wsEnabled" type="checkbox" ${state.wsEnabled ? "checked" : ""} />
-        </label>
-        <label class="field">
-          <span>数据源</span>
-          <input type="text" readonly value="${WS_SOURCE_OPTIONS[0].label}" />
-        </label>
-        <label class="field" style="grid-column: 1 / -1;">
-          <span>交易对（逗号分隔）</span>
-          <input data-path="wsSymbols" type="text" value="${escapeHtml(state.wsSymbols)}" />
-        </label>
-        <label class="field" style="grid-column: 1 / -1;">
-          <span>状态</span>
-          <input id="wsStatusText" type="text" readonly value="${escapeHtml(state.wsStatus)}" />
         </label>
       </div>
     </section>
@@ -733,13 +535,6 @@ function renderControls() {
       state[number] = event.currentTarget.type === "checkbox" ? event.currentTarget.checked : Number(event.currentTarget.value);
       renderer.syncTargets();
       renderer.render(performance.now());
-      if (number === "wsEnabled") {
-        if (state.wsEnabled) {
-          connectMarketSocket();
-        } else {
-          stopMarketSocket();
-        }
-      }
     });
   });
 
@@ -771,15 +566,6 @@ function renderControls() {
           });
         }
       });
-    });
-  });
-
-  controlsEl.querySelectorAll('[data-path="wsSymbols"]').forEach((input) => {
-    const eventName = input.tagName === "SELECT" ? "change" : "blur";
-    input.addEventListener(eventName, () => {
-      if (state.wsEnabled) {
-        connectMarketSocket();
-      }
     });
   });
 
