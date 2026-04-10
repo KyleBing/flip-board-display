@@ -1409,9 +1409,31 @@ class FlipBoardRenderer {
       this.drawHalfChar(x, y, width, height, toChar, "top", 1, topRect, radius);
       this.drawHalfChar(x, y, width, height, fromChar, "bottom", 1, bottomRect, radius);
       this.drawTopFlap(x, y, width, height, fromChar, 1 - firstHalf, topRect, radius, backgroundTop);
+      this.drawFlipShadowOverlay({
+        stage: "top",
+        x,
+        y,
+        width,
+        height,
+        progress: firstHalf,
+        topRect,
+        bottomRect,
+        cardGap,
+      });
     } else if (easedProgress < 1) {
       this.drawHalfChar(x, y, width, height, toChar, "top", 1, topRect, radius);
       this.drawHalfChar(x, y, width, height, fromChar, "bottom", 1, bottomRect, radius);
+      this.drawFlipShadowOverlay({
+        stage: "bottom",
+        x,
+        y,
+        width,
+        height,
+        progress: secondHalf,
+        topRect,
+        bottomRect,
+        cardGap,
+      });
       this.drawBottomFlap(x, y, width, height, toChar, secondHalf, bottomRect, radius, backgroundBottom);
     } else {
       this.drawStaticChar(x, y, width, height, toChar, topRect, bottomRect, radius);
@@ -1431,6 +1453,70 @@ class FlipBoardRenderer {
     this.ctx.fillStyle = "rgba(255,255,255,0.2)";
     this.ctx.fillRect(leftPinX, pinY + 1, 1, pinHeight - 2);
     this.ctx.fillRect(rightPinX, pinY + 1, 1, pinHeight - 2);
+  }
+
+  drawFlipShadowOverlay({ stage, x, y, width, height, progress, topRect, bottomRect, cardGap }) {
+    const p = clamp(progress, 0, 1);
+    // 顶半阶段在 p=0 时无需阴影；底半阶段需要在 p=0 接住上一阶段阴影，不能提前 return。
+    if (stage === "top" && p <= 0) {
+      return;
+    }
+
+    const splitY = y + height / 2;
+    const innerX = topRect.x;
+    const innerW = topRect.width;
+
+    if (stage === "top") {
+      // 上半翻动时：阴影压到下半上方，并向字符下方外溢一点。
+      const alpha = 0.66 * Math.pow(p, 1.4);
+      const shadowHeight = Math.max(12, bottomRect.height * (1.2 + 0.35 * p));
+      const overflow = Math.max(14, height * 0.4);
+      const shadowTop = splitY + cardGap / 2 - 1;
+      const shadowBottom = shadowTop + shadowHeight + overflow;
+      const gradient = this.ctx.createLinearGradient(0, shadowTop, 0, shadowBottom);
+      gradient.addColorStop(0, `rgba(0,0,0,${alpha.toFixed(3)})`);
+      gradient.addColorStop(0.62, `rgba(0,0,0,${(alpha * 0.6).toFixed(3)})`);
+      gradient.addColorStop(1, "rgba(0,0,0,0)");
+
+      this.ctx.save();
+      this.ctx.fillStyle = gradient;
+      this.ctx.fillRect(innerX, shadowTop, innerW, shadowBottom - shadowTop);
+      this.ctx.restore();
+      return;
+    }
+
+    // 下半翻动时：阴影放在“翻动下半片”和“原下半片”之间，随翻动向下移动。
+    const seamY = splitY + cardGap / 2 + p * bottomRect.height * 0.82;
+    const bandHeight = Math.max(10, bottomRect.height * 0.45);
+    const topStageEndAlpha = 0.66 * Math.pow(1, 1.4);
+    const inheritedStartAlpha = topStageEndAlpha; // 下半起始严格继承上半结尾强度。
+    const decay = Math.pow(1 - p, 1.05); // 下半阶段末尾过渡到 0。
+    const alpha = inheritedStartAlpha * decay;
+    const gradient = this.ctx.createLinearGradient(0, seamY, 0, seamY + bandHeight);
+    gradient.addColorStop(0, `rgba(0,0,0,${alpha.toFixed(3)})`);
+    gradient.addColorStop(0.36, `rgba(0,0,0,${(alpha * 0.42).toFixed(3)})`);
+    gradient.addColorStop(1, "rgba(0,0,0,0)");
+
+    // 继承上半翻下来的大面积阴影：保留一定外溢，避免切到下半时“突然掉光”。
+    const carryHeight = Math.max(16, bottomRect.height * 1.15);
+    const carryOverflow = Math.max(10, height * 0.28);
+    const carryBottom = splitY + carryHeight + carryOverflow;
+    const carryGradient = this.ctx.createLinearGradient(0, splitY, 0, carryBottom);
+    carryGradient.addColorStop(0, `rgba(0,0,0,${(alpha * 0.92).toFixed(3)})`);
+    carryGradient.addColorStop(0.58, `rgba(0,0,0,${(alpha * 0.44).toFixed(3)})`);
+    carryGradient.addColorStop(1, "rgba(0,0,0,0)");
+    this.ctx.save();
+    this.ctx.fillStyle = carryGradient;
+    this.ctx.fillRect(innerX, splitY, innerW, carryBottom - splitY);
+    this.ctx.restore();
+
+    // 夹层阴影限制在下半卡片内，表现翻动下半片与原下半片之间的接触区。
+    this.ctx.save();
+    this.drawRoundedRect(bottomRect.x, bottomRect.y, bottomRect.width, bottomRect.height, 0);
+    this.ctx.clip();
+    this.ctx.fillStyle = gradient;
+    this.ctx.fillRect(innerX, seamY, innerW, bandHeight);
+    this.ctx.restore();
   }
 
   drawStaticChar(x, y, width, height, char, topRect, bottomRect, radius) {
