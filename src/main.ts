@@ -113,9 +113,24 @@ const ctx = canvas.getContext("2d");
 
 const tileState = new Map();
 const resizeObserver = new ResizeObserver(() => renderNow());
+let pendingFontRenderPromise = null;
+const FLIP_LAYOUT_WARN = Boolean(import.meta.env?.DEV);
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+async function ensureCanvasFontLoaded() {
+  if (!document.fonts?.load) {
+    return;
+  }
+
+  const fontSize = Math.max(12, Math.floor(state.charHeight * clamp(Number(state.fontScale), 0.6, 1)));
+  try {
+    await document.fonts.load(`700 ${fontSize}px ${state.fontFamily}`, "A");
+  } catch {
+    // Keep fallback rendering if font load fails.
+  }
 }
 
 function sanitizeChar(char) {
@@ -157,6 +172,8 @@ const ARTICLE_COLUMN_ID = "article-quote-column";
 const ARTICLE_CANVAS_INSET_PX = 20;
 /** 句子正文区左右各保留的空白字符列数（在已扣除 canvas inset 的网格内）。 */
 const ARTICLE_TEXT_SIDE_MARGIN_COLS = 5;
+/** 句子正文区最少可用字符列数，避免窄屏/瞬时尺寸导致逐字竖排。 */
+const ARTICLE_MIN_TEXT_COLS = 8;
 /** 金句模式字距（列间距）下限（像素），优先满足后再分配剩余宽度。 */
 const ARTICLE_MIN_TILE_GAP_PX = 5;
 /** 金句模式行距下限（像素），优先满足后再分配剩余高度。 */
@@ -261,25 +278,16 @@ function wrapArticleText(rawText, maxChars) {
 }
 
 function computeArticleLayout(text, maxLineChars, maxRows) {
-  // 在行数限制内找到最大可用单行字符数，让句子尽量少换行。
-  let lo = 1;
-  let hi = maxLineChars;
-  let bestW = 1;
-
-  while (lo <= hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    const lineCount = wrapArticleText(text, mid).length;
-    // 二分：在不超过 maxRows 行前提下，尽量增大单行字符数。
-    if (lineCount <= maxRows) {
-      bestW = mid;
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
+  const safeMaxLineChars = Math.max(1, Math.floor(Number(maxLineChars) || 1));
+  const safeMaxRows = Math.max(1, Math.floor(Number(maxRows) || 1));
+  // 直接从最大宽度向下找第一个满足行数约束的宽度，避免极端帧参数导致二分退化。
+  let bestW = safeMaxLineChars;
+  for (let width = safeMaxLineChars; width >= 1; width -= 1) {
+    const lineCount = wrapArticleText(text, width).length;
+    if (lineCount <= safeMaxRows) {
+      bestW = width;
+      break;
     }
-  }
-
-  if (wrapArticleText(text, maxLineChars).length > maxRows) {
-    bestW = maxLineChars;
   }
 
   const lines = wrapArticleText(text, bestW);
@@ -743,6 +751,9 @@ function renderControls() {
       if (path === "displayMode") {
         renderControls();
       }
+      if (path === "fontFamily") {
+        scheduleRenderAfterFontReady();
+      }
       renderer.invalidateLayout();
       renderNow();
     });
@@ -938,6 +949,8 @@ class FlipBoardRenderer {
     this.cachedViewportHeight = 0;
     this.cachedLayout = null;
     this.cachedLayoutStamp = null;
+    this.lastStableViewportWidth = 0;
+    this.lastStableViewportHeight = 0;
     this.invalidateLayout();
   }
 
@@ -999,15 +1012,27 @@ class FlipBoardRenderer {
         innerH,
       );
 
+      // 保证正文区至少有 ARTICLE_MIN_TEXT_COLS 列；当总列数不足时自动缩小左右留白。
       const sideMarginCols = Math.min(
         ARTICLE_TEXT_SIDE_MARGIN_COLS,
-        Math.max(0, Math.floor((gridCols - 1) / 2)),
+        Math.max(0, Math.floor((gridCols - ARTICLE_MIN_TEXT_COLS) / 2)),
       );
       // 句子正文区可用列数（扣除左右保留空白列）。
       const innerCols = Math.max(1, gridCols - sideMarginCols * 2);
 
-      const { lines: contentLines } = computeArticleLayout(articleText, innerCols, gridRows);
+      const { lines: contentLines, wrapWidth } = computeArticleLayout(articleText, innerCols, gridRows);
       const displayLines = contentLines.length > gridRows ? contentLines.slice(0, gridRows) : contentLines;
+      if (FLIP_LAYOUT_WARN && innerCols > 1 && wrapWidth <= 1) {
+        console.warn("[flip-board] unexpected wrapWidth collapse", {
+          articleIndex: state.articleIndex,
+          wrapWidth,
+          innerCols,
+          gridRows,
+          viewportWidth,
+          viewportHeight,
+          textPreview: String(articleText ?? "").slice(0, 120),
+        });
+      }
 
       const articleColumn = {
         id: ARTICLE_COLUMN_ID,
@@ -1145,6 +1170,59 @@ class FlipBoardRenderer {
     this.invalidateLayout();
   }
 
+  getViewportSize() {
+    const isFullscreen = document.fullscreenElement === this.canvas;
+    const fallbackWidth = this.lastStableViewportWidth > 0 ? this.lastStableViewportWidth : 1280;
+    const fallbackHeight = this.lastStableViewportHeight > 0 ? this.lastStableViewportHeight : 720;
+
+    let measuredWidth = 0;
+    let measuredHeight = 0;
+    if (isFullscreen) {
+      measuredWidth = window.innerWidth;
+      measuredHeight = window.innerHeight;
+    } else {
+      // Prefer client box size to avoid feeding border thickness back into canvas size.
+      measuredWidth = this.viewport.clientWidth;
+      measuredHeight = this.viewport.clientHeight;
+
+      // client size can be 0 during transient layout; fallback to rect for that frame.
+      const rect = this.viewport.getBoundingClientRect();
+      if (measuredWidth <= 0) {
+        measuredWidth = rect.width;
+      }
+      if (measuredHeight <= 0) {
+        measuredHeight = rect.height;
+      }
+    }
+
+    const usedTinyWidthFallback = measuredWidth < 200;
+    const usedTinyHeightFallback = measuredHeight < 140;
+
+    // During mode/fullscreen transitions, viewport can momentarily report tiny values.
+    let width = !usedTinyWidthFallback ? Math.floor(measuredWidth) : fallbackWidth;
+    let height = !usedTinyHeightFallback ? Math.floor(measuredHeight) : fallbackHeight;
+    let usedArticleWidthGuard = false;
+    let usedArticleHeightGuard = false;
+
+    if (state.displayMode === "articles") {
+      // Keep enough width for minimum text columns; otherwise reuse stable size.
+      const minArticleWidth = ARTICLE_CANVAS_INSET_PX * 2 + ARTICLE_MIN_TEXT_COLS * state.charWidth;
+      if (width < minArticleWidth) {
+        width = fallbackWidth;
+        usedArticleWidthGuard = true;
+      }
+      // Keep at least one stable text row height budget in article mode.
+      const minArticleHeight = ARTICLE_CANVAS_INSET_PX * 2 + state.charHeight;
+      if (height < minArticleHeight) {
+        height = fallbackHeight;
+        usedArticleHeightGuard = true;
+      }
+    }
+    this.lastStableViewportWidth = width;
+    this.lastStableViewportHeight = height;
+    return { width, height };
+  }
+
   replayAllTiles() {
     const startedAt = performance.now();
 
@@ -1154,9 +1232,7 @@ class FlipBoardRenderer {
   }
 
   render(now) {
-    const isFullscreen = document.fullscreenElement === this.canvas;
-    const viewportWidth = isFullscreen ? window.innerWidth : this.viewport.clientWidth;
-    const viewportHeight = isFullscreen ? window.innerHeight : this.viewport.clientHeight;
+    const { width: viewportWidth, height: viewportHeight } = this.getViewportSize();
     const canvasWidth = Math.max(320, Math.floor(viewportWidth));
     const canvasHeight = Math.max(240, Math.floor(viewportHeight));
     const layout = this.getCachedLayout(canvasWidth, canvasHeight);
@@ -1652,6 +1728,20 @@ function renderNow() {
   }
 }
 
+function scheduleRenderAfterFontReady() {
+  if (pendingFontRenderPromise) {
+    return pendingFontRenderPromise;
+  }
+
+  pendingFontRenderPromise = ensureCanvasFontLoaded().finally(() => {
+    pendingFontRenderPromise = null;
+    renderer.invalidateLayout();
+    renderNow();
+  });
+
+  return pendingFontRenderPromise;
+}
+
 fullscreenButton.addEventListener("click", async () => {
   if (document.fullscreenElement === canvas) {
     await document.exitFullscreen();
@@ -1682,6 +1772,7 @@ window.addEventListener("resize", () => renderNow());
 renderControls();
 renderer.invalidateLayout();
 renderNow();
+scheduleRenderAfterFontReady();
 
 const AUTO_REFRESH_MS = 20000;
 setInterval(() => {
